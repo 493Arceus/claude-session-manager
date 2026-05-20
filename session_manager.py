@@ -3,6 +3,25 @@ from __future__ import annotations
 
 import os
 import sys
+
+# PyInstaller 打包后需要显式设置 Tcl/Tk 库路径
+if getattr(sys, "frozen", False):
+    _meipass = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    # PyInstaller 标准路径
+    _tcl = os.path.join(_meipass, "_tcl_data")
+    _tk = os.path.join(_meipass, "_tk_data")
+    # 备选路径（旧版或自定义打包）
+    _tcl2 = os.path.join(_meipass, "tcl", "tcl8.6")
+    _tk2 = os.path.join(_meipass, "tk", "tk8.6")
+    if os.path.isdir(_tcl):
+        os.environ["TCL_LIBRARY"] = _tcl
+    elif os.path.isdir(_tcl2):
+        os.environ["TCL_LIBRARY"] = _tcl2
+    if os.path.isdir(_tk):
+        os.environ["TK_LIBRARY"] = _tk
+    elif os.path.isdir(_tk2):
+        os.environ["TK_LIBRARY"] = _tk2
+
 import threading
 import tkinter as tk
 from pathlib import Path
