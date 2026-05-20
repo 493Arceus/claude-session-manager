@@ -64,11 +64,15 @@ FONT_BODY = ("Microsoft YaHei", "PingFang SC", "Segoe UI", "Helvetica Neue", "Ar
 class SessionCard(ctk.CTkFrame):
     """可点击的会话卡片."""
 
+    # 需要跳过绑定的控件类型（避免干扰交互控件）
+    _SKIP_BIND_TYPES = (ctk.CTkButton, ctk.CTkEntry, ctk.CTkTextbox, ctk.CTkOptionMenu, ctk.CTkComboBox)
+
     def __init__(self, master, session: Session, on_click, **kwargs):
         super().__init__(master, **kwargs)
         self.session = session
         self.on_click = on_click
         self.is_selected = False
+        self._click_debounce = False
 
         self.configure(
             corner_radius=10,
@@ -77,13 +81,9 @@ class SessionCard(ctk.CTkFrame):
             fg_color=COLOR_CARD_NORMAL,
         )
 
-        # 只在最外层绑定点击，子控件事件会冒泡上来
-        self.bind("<Button-1>", self._handle_click)
-
         # 标题行
         self.title_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.title_frame.pack(fill="x", padx=12, pady=(10, 2))
-        # 不拦截子控件事件，让它们冒泡到 SessionCard
 
         # 活跃状态指示点
         self.dot_label = ctk.CTkLabel(
@@ -156,14 +156,30 @@ class SessionCard(ctk.CTkFrame):
             )
             self.active_label.pack(side="left")
 
-        # 悬停效果
+        # 悬停效果（tkinter 默认会冒泡到父级）
         self.bind("<Enter>", self._on_enter)
         self.bind("<Leave>", self._on_leave)
+        # 点击事件递归绑定到所有子控件（CustomTkinter 内部 Canvas 可能不冒泡）
+        self._bind_recursive(self, "<Button-1>", self._handle_click)
+
+    def _bind_recursive(self, widget, event, handler):
+        """为 widget 及其所有后代递归绑定事件，跳过交互控件."""
+        if not isinstance(widget, self._SKIP_BIND_TYPES):
+            widget.bind(event, handler)
+        for child in widget.winfo_children():
+            self._bind_recursive(child, event, handler)
 
     def _handle_click(self, event=None):
-        """处理点击事件，阻止冒泡避免重复触发."""
+        """处理点击事件，防抖避免重复触发."""
+        if self._click_debounce:
+            return "break"
+        self._click_debounce = True
+        self.after(100, self._reset_debounce)
         self.on_click(self.session)
         return "break"
+
+    def _reset_debounce(self):
+        self._click_debounce = False
 
     def _on_enter(self, event=None):
         if not self.is_selected:
