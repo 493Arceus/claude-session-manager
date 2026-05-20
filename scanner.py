@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -10,16 +11,17 @@ from typing import Optional
 from models import Project, Session, decode_project_name
 from utils import get_projects_dir, get_sessions_dir
 
+# File-level cache: filepath -> (mtime, Session)
+_session_cache: dict[str, tuple[float, Session]] = {}
+
 
 def parse_iso_timestamp(ts: str) -> Optional[datetime]:
     """Parse ISO 8601 timestamp string."""
     if not ts:
         return None
     try:
-        # Handle Z suffix
         ts = ts.replace("Z", "+00:00")
         dt = datetime.fromisoformat(ts)
-        # Convert offset-aware to offset-naive for consistent comparison
         if dt.tzinfo is not None:
             dt = dt.replace(tzinfo=None)
         return dt
@@ -71,14 +73,12 @@ def extract_message_preview(msg: dict) -> Optional[str]:
         return None
 
     if msg_type == "ai-title":
-        # ai-title has aiTitle at top level or nested
         title = msg.get("aiTitle")
         if title:
             return title
         return msg.get("message", {}).get("title")
 
     if msg_type == "last-prompt":
-        # last-prompt has lastPrompt at top level
         prompt = msg.get("lastPrompt")
         if prompt:
             return prompt
@@ -90,10 +90,24 @@ def extract_message_preview(msg: dict) -> Optional[str]:
 def scan_session_file(filepath: Path) -> Optional[Session]:
     """Parse a single .jsonl session file and extract metadata.
 
-    Uses efficient streaming to handle large files.
+    Uses file-level cache based on mtime to avoid re-parsing unchanged files.
     """
+    global _session_cache
+
     if not filepath.exists() or not filepath.is_file():
         return None
+
+    cache_key = str(filepath)
+    try:
+        mtime = filepath.stat().st_mtime
+    except OSError:
+        return None
+
+    # Check cache
+    if cache_key in _session_cache:
+        cached_mtime, cached_session = _session_cache[cache_key]
+        if cached_mtime == mtime:
+            return replace(cached_session)
 
     session_id = filepath.stem
     project_name = filepath.parent.name
@@ -113,14 +127,12 @@ def scan_session_file(filepath: Path) -> Optional[Session]:
             if first_line.strip():
                 try:
                     first_msg = json.loads(first_line)
-                    # Extract cwd from first message for accurate project path
                     cwd = first_msg.get("cwd")
                     if cwd:
                         project_path = cwd
                     ts = first_msg.get("timestamp")
                     if ts:
                         first_timestamp = parse_iso_timestamp(ts)
-                    # Fallback: check for startedAt in first message
                     if not first_timestamp:
                         started_at = first_msg.get("startedAt")
                         if started_at:
@@ -128,7 +140,6 @@ def scan_session_file(filepath: Path) -> Optional[Session]:
                 except json.JSONDecodeError:
                     pass
 
-            # Read line by line for the rest
             prev_line = ""
             for line in f:
                 prev_line = line
@@ -140,31 +151,26 @@ def scan_session_file(filepath: Path) -> Optional[Session]:
                 except json.JSONDecodeError:
                     continue
 
-                # Extract cwd from any message (first one with cwd wins)
                 if not project_path or project_path == decode_project_name(project_name):
                     cwd = msg.get("cwd")
                     if cwd:
                         project_path = cwd
 
-                # Extract title
                 if msg.get("type") == "ai-title":
                     new_title = extract_message_preview(msg)
                     if new_title:
                         title = new_title
 
-                # Extract last user prompt
                 if msg.get("type") == "user":
                     preview = extract_message_preview(msg)
                     if preview:
                         last_user_message = preview
 
-                # Extract last-prompt
                 if msg.get("type") == "last-prompt":
                     preview = extract_message_preview(msg)
                     if preview:
                         last_prompt = preview
 
-            # Last line timestamp
             if prev_line.strip():
                 try:
                     last_msg = json.loads(prev_line)
@@ -177,15 +183,13 @@ def scan_session_file(filepath: Path) -> Optional[Session]:
     except OSError:
         return None
 
-    # Use last user message as last_prompt if not found
     if not last_prompt and last_user_message:
         last_prompt = last_user_message
 
-    # If no title found, try to derive from first user message
     if not title and last_prompt:
         title = last_prompt[:60]
 
-    return Session(
+    session = Session(
         session_id=session_id,
         project_name=project_name,
         project_path=project_path,
@@ -198,13 +202,12 @@ def scan_session_file(filepath: Path) -> Optional[Session]:
         file_size=file_size,
     )
 
+    _session_cache[cache_key] = (mtime, session)
+    return replace(session)
+
 
 def load_active_sessions() -> dict[str, int]:
-    """Load active session IDs mapped to their PIDs.
-
-    Returns:
-        Dict mapping session_id -> pid
-    """
+    """Load active session IDs mapped to their PIDs."""
     active: dict[str, int] = {}
     sessions_dir = get_sessions_dir()
 
@@ -218,7 +221,6 @@ def load_active_sessions() -> dict[str, int]:
             session_id = data.get("sessionId")
             pid = data.get("pid")
             if session_id and pid:
-                # Verify process is still running
                 if is_process_running(pid):
                     active[session_id] = pid
         except (json.JSONDecodeError, OSError):
@@ -231,7 +233,6 @@ def is_process_running(pid: int) -> bool:
     """Check if a process with given PID is still running."""
     if os.name == "nt":
         import ctypes
-
         kernel32 = ctypes.windll.kernel32
         handle = kernel32.OpenProcess(1, False, pid)
         if handle:
@@ -247,11 +248,7 @@ def is_process_running(pid: int) -> bool:
 
 
 def scan_all_projects() -> list[Project]:
-    """Scan all projects and their sessions.
-
-    Returns:
-        List of Project objects sorted by latest activity.
-    """
+    """Scan all projects and their sessions."""
     projects_dir = get_projects_dir()
     if not projects_dir.exists():
         return []
@@ -269,21 +266,17 @@ def scan_all_projects() -> list[Project]:
         for session_file in project_dir.glob("*.jsonl"):
             session = scan_session_file(session_file)
             if session:
-                # Check if active
                 if session.session_id in active_sessions:
-                    session.is_active = True
-                    session.active_pid = active_sessions[session.session_id]
+                    session = replace(session, is_active=True, active_pid=active_sessions[session.session_id])
                 project.sessions.append(session)
 
         if project.sessions:
-            # Sort sessions by last activity (newest first)
             project.sessions.sort(
                 key=lambda s: s.last_timestamp or datetime.min,
                 reverse=True,
             )
             projects.append(project)
 
-    # Sort projects by latest session activity
     projects.sort(
         key=lambda p: (p.latest_session().last_timestamp or datetime.min),
         reverse=True,
@@ -293,21 +286,18 @@ def scan_all_projects() -> list[Project]:
 
 
 def delete_session(session: Session) -> bool:
-    """Delete a session and its associated data.
-
-    Returns True if successful.
-    """
+    """Delete a session and its associated data."""
+    global _session_cache
     try:
-        # Delete the main jsonl file
         filepath = Path(session.file_path)
         if filepath.exists():
             filepath.unlink()
+            # Remove from cache
+            _session_cache.pop(str(filepath), None)
 
-        # Delete session subdirectory if exists
         session_dir = filepath.parent / session.session_id
         if session_dir.exists() and session_dir.is_dir():
             import shutil
-
             shutil.rmtree(session_dir)
 
         return True
@@ -316,10 +306,7 @@ def delete_session(session: Session) -> bool:
 
 
 def get_session_preview_messages(filepath: Path, count: int = 5) -> list[dict]:
-    """Get the last N messages from a session file for preview.
-
-    Returns list of dicts with 'type', 'preview', 'timestamp'.
-    """
+    """Get the last N messages from a session file for preview."""
     messages = []
     if not filepath.exists():
         return messages
@@ -329,7 +316,6 @@ def get_session_preview_messages(filepath: Path, count: int = 5) -> list[dict]:
         with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
             lines = f.readlines()
 
-        # Take last N non-empty lines
         for line in reversed(lines):
             if len(messages) >= count:
                 break
@@ -358,6 +344,5 @@ def get_session_preview_messages(filepath: Path, count: int = 5) -> list[dict]:
     except OSError:
         pass
 
-    # Reverse to get chronological order
     messages.reverse()
     return messages
